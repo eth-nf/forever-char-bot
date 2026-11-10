@@ -110,3 +110,7 @@ library with the network stubbed to check the requests it sends. They need no cr
 | `src/views/` | The Discord embeds, built from API data |
 | `src/commands/` | The slash commands and the interaction router |
 | `scripts/smoke.ts` | The live check against the real API |
+
+## License
+
+[MIT](LICENSE)

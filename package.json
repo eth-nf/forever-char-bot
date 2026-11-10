@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Discord bot for looking up WoW: Forever characters, guilds and auction house prices.",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": ">=22.18"
