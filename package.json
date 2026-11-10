@@ -1,0 +1,25 @@
+{
+  "name": "forever-char-bot",
+  "version": "0.1.0",
+  "description": "Discord bot for looking up WoW: Forever characters, guilds and auction house prices.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/index.ts",
+    "dev": "node --watch src/index.ts",
+    "smoke": "node scripts/smoke.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"tests/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@pinta365/blizzard_api": "^0.8.4",
+    "discord.js": "^14.28.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  }
+}
