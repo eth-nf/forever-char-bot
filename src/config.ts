@@ -23,8 +23,8 @@ export interface Config {
     rulesetId: number;
     /** Restricts `/price` to these auction house IDs, once you know which ones are yours. */
     auctionHouseIds?: number[];
-    /** Auction snapshots older than this are refreshed in the background. */
-    auctionMaxAgeMinutes: number;
+    /** How often to ask Blizzard whether the auction houses have new data. */
+    auctionCheckMinutes: number;
     /** Load auction data at startup so the first `/price` is fast. */
     auctionWarmup: boolean;
     /** Folder for data the bot has to keep across restarts (character claims). Nothing is saved without it. */
@@ -108,7 +108,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, options: { requ
         defaultFaction: faction as PlayerFaction | undefined,
         rulesetId: int(env, "RULESET_ID", 15),
         auctionHouseIds: houseIds?.length ? houseIds : undefined,
-        auctionMaxAgeMinutes: int(env, "AH_MAX_AGE_MINUTES", 60),
+        auctionCheckMinutes: Math.max(1, int(env, "AH_CHECK_MINUTES", 5)),
         auctionWarmup: (get("AH_WARMUP") ?? "true").toLowerCase() !== "false",
         dataDir: resolve(import.meta.dirname, "..", get("DATA_DIR") ?? "data"),
     };

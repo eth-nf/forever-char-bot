@@ -285,18 +285,35 @@ const HOUSES = [
     { key: href("/x"), name: "Horde Auction House", id: 114 },
 ];
 
+/** When the fake auction data was last updated by "Blizzard". */
+export const AUCTIONS_UPDATED_AT = Date.UTC(2026, 10, 11, 13, 22, 33);
+
 export interface FakeApi {
     forever: ForeverApi & AuctionApi;
     retail: RetailApi;
     /** How often each endpoint was called. */
     calls: Record<string, number>;
     /** Flip to make the character API return 404, as for a character below level 10. */
-    state: { characterExists: boolean; mediaExists: boolean; brokenHouses: Set<number> };
+    state: {
+        characterExists: boolean;
+        mediaExists: boolean;
+        brokenHouses: Set<number>;
+        /** When Blizzard last updated the auction data. Move it forward to publish new data. */
+        updatedAt: number;
+        /** Added to one Linen Cloth buyout, to tell new auction data from old. */
+        priceChange: number;
+    };
 }
 
 export function fakeApi(): FakeApi {
     const calls: Record<string, number> = {};
-    const state = { characterExists: true, mediaExists: true, brokenHouses: new Set<number>() };
+    const state = {
+        characterExists: true,
+        mediaExists: true,
+        brokenHouses: new Set<number>(),
+        updatedAt: AUCTIONS_UPDATED_AT,
+        priceChange: 0,
+    };
     const isChris = (name: string, surname: string) => `${name}-${surname}`.toLowerCase() === "chaos-chris";
     const forChris = <T>(value: T) => async (name: string, surname: string) => {
         if (!state.characterExists || !isChris(name, surname)) throw notFound();
@@ -335,26 +352,30 @@ export function fakeApi(): FakeApi {
         }),
         ...itemEndpoints(FOREVER_ITEMS),
         auctionHouses: async () => ({ ...self("/x"), auctions: HOUSES }),
-        auctionHouse: async (_ruleset: number, houseId: number) => {
+        // Like the live API, a request that sends the time of the copy it has gets nothing back if that's current.
+        auctions: async (_ruleset: number, houseId: number, since?: number) => {
             if (state.brokenHouses.has(houseId)) throw new errors.APIError("Bad Gateway", 502, "");
-            const house = HOUSES.find((entry) => entry.id === houseId);
-            if (!house) throw notFound();
-            const base = { ...self("/x"), id: houseId, name: house.name, commodities: href("/x"), ruleset: href("/x") };
-            // House 112 is empty: the API then leaves the `auctions` field out.
-            if (houseId === 112) return base;
+            if (!HOUSES.some((entry) => entry.id === houseId)) throw notFound();
+            if (since !== undefined && since >= state.updatedAt) return undefined;
+            // House 112 is empty.
+            if (houseId === 112) return { listings: [], lastModified: state.updatedAt };
             return {
-                ...base,
-                auctions: [
+                listings: [
                     // A stack of 20 for 40s buyout: 2s each.
                     { id: 1, item: { id: LINEN }, buyout: 4000, bid: 2000, quantity: 20, time_left: "LONG" },
-                    { id: 2, item: { id: LINEN }, buyout: 50 + houseId, quantity: 1, time_left: "SHORT" },
+                    { id: 2, item: { id: LINEN }, buyout: 50 + houseId + state.priceChange, quantity: 1, time_left: "SHORT" },
                     { id: 3, item: { id: BRAWLER_GLOVES }, bid: 900, quantity: 1, time_left: "MEDIUM" },
                 ],
+                lastModified: state.updatedAt,
             };
         },
-        auctionHouseCommodities: async (_ruleset: number, houseId: number) => {
+        commodities: async (_ruleset: number, houseId: number, since?: number) => {
             if (houseId === 112 || houseId === 114) throw notFound();
-            return { ...self("/x"), auctions: [{ id: 9, item: { id: WOOL }, quantity: 400, unit_price: 310, time_left: "LONG" }] };
+            if (since !== undefined && since >= state.updatedAt) return undefined;
+            return {
+                listings: [{ id: 9, item: { id: WOOL }, quantity: 400, unit_price: 310, time_left: "LONG" }],
+                lastModified: state.updatedAt,
+            };
         },
     };
 
@@ -381,7 +402,7 @@ export const config: Config = {
     defaultGuild: "Burning Legion",
     defaultFaction: "horde",
     rulesetId: 15,
-    auctionMaxAgeMinutes: 60,
+    auctionCheckMinutes: 60,
     auctionWarmup: false,
 };
 
@@ -394,7 +415,7 @@ export function fakeContext(api: FakeApi = fakeApi(), overrides: Partial<Config>
         auctions: new AuctionService(api.forever, {
             rulesetId: merged.rulesetId,
             houseIds: merged.auctionHouseIds,
-            maxAgeMs: merged.auctionMaxAgeMinutes * 60_000,
+            checkMs: merged.auctionCheckMinutes * 60_000,
         }),
     };
 }

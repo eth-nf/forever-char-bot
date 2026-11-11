@@ -1,9 +1,11 @@
 import type { WowForeverApi } from "@pinta365/blizzard_api";
 import type { AuctionListing, commodity as Commodity } from "@pinta365/blizzard_api/wow";
 import { mapLimit, TtlCache } from "../util/cache.ts";
+import type { AuctionFeed, Fetched } from "./auctionFeed.ts";
 import { isNotFound } from "./service.ts";
 
-export type AuctionApi = Pick<WowForeverApi, "auctionHouses" | "auctionHouse" | "auctionHouseCommodities">;
+/** The house index comes through the library; the listings through the feed, which can ask for changes only. */
+export type AuctionApi = Pick<WowForeverApi, "auctionHouses"> & AuctionFeed;
 
 export type HouseFaction = "alliance" | "horde" | "neutral";
 
@@ -26,14 +28,18 @@ export interface ItemPrice {
 
 export interface HouseSnapshot {
     house: HouseRef;
-    fetchedAt: number;
+    /** When Blizzard last updated this house's data. When it doesn't say, when the bot downloaded it. */
+    updatedAt: number;
+    /** When the bot last asked Blizzard for newer data. */
+    checkedAt: number;
     items: Map<number, ItemPrice>;
     listings: number;
 }
 
 export interface PriceRow {
     house: HouseRef;
-    fetchedAt: number;
+    /** When Blizzard last updated the house's data. */
+    updatedAt: number;
     /** Absent when the house has no listings of the item. */
     price?: ItemPrice;
 }
@@ -80,24 +86,58 @@ export function aggregateListings(
     return items;
 }
 
+const lower = (a?: number, b?: number) => (a === undefined ? b : b === undefined ? a : Math.min(a, b));
+
+/** Combines two per-item summaries, as if their listings had been aggregated together. */
+export function mergeItemPrices(a: Map<number, ItemPrice>, b: Map<number, ItemPrice>): Map<number, ItemPrice> {
+    const merged = new Map<number, ItemPrice>();
+    for (const map of [a, b]) {
+        for (const [id, price] of map) {
+            const seen = merged.get(id);
+            if (!seen) {
+                merged.set(id, { ...price });
+                continue;
+            }
+            seen.quantity += price.quantity;
+            seen.listings += price.listings;
+            const minBuyout = lower(seen.minBuyout, price.minBuyout);
+            const minBid = lower(seen.minBid, price.minBid);
+            if (minBuyout !== undefined) seen.minBuyout = minBuyout;
+            if (minBid !== undefined) seen.minBid = minBid;
+        }
+    }
+    return merged;
+}
+
+/** One of a house's two listing endpoints, as last downloaded. */
+interface Part {
+    items: Map<number, ItemPrice>;
+    listings: number;
+    lastModified?: number;
+}
+
 export interface AuctionServiceOptions {
     /** Any valid ruleset ID. Every ruleset of a region currently lists the same houses with the same auctions. */
     rulesetId: number;
     /** Limits the service to these houses. */
     houseIds?: number[];
-    maxAgeMs: number;
+    /** How often to ask Blizzard whether a house has new data. */
+    checkMs: number;
 }
 
 /**
- * Auction house prices. Snapshots are loaded per house on demand and reused until they are `maxAgeMs` old; after
- * that the old snapshot is still served at once while a new one loads in the background.
+ * Auction house prices. A house is downloaded the first time it's needed, and from then on checked for new data
+ * every `checkMs`: Blizzard updates it about once an hour, and a check that finds nothing new costs almost nothing.
+ * Lookups never wait for a check; they get the newest data the bot has.
  */
 export class AuctionService {
     readonly #api: AuctionApi;
     readonly #options: AuctionServiceOptions;
     readonly #houses = new TtlCache<HouseRef[]>(6 * 60 * 60_000);
     readonly #snapshots = new Map<number, HouseSnapshot>();
+    readonly #parts = new Map<number, { auctions: Part; commodities: Part }>();
     readonly #loading = new Map<number, Promise<HouseSnapshot>>();
+    #timer?: NodeJS.Timeout;
 
     constructor(api: AuctionApi, options: AuctionServiceOptions) {
         this.#api = api;
@@ -129,33 +169,67 @@ export class AuctionService {
         return this.#snapshots.get(houseId);
     }
 
+    /**
+     * The house's newest snapshot. The first call downloads it; later calls return at once, and start a check in the
+     * background if the last one is more than `checkMs` ago (when the polling isn't running, or has stalled).
+     */
     snapshot(house: HouseRef): Promise<HouseSnapshot> {
         const current = this.#snapshots.get(house.id);
-        if (current && Date.now() - current.fetchedAt < this.#options.maxAgeMs) return Promise.resolve(current);
-
-        const refresh = this.#refresh(house);
-        if (!current) return refresh;
-        refresh.catch((error) => console.warn(`[auctions] refreshing house ${house.id} failed:`, error.message));
+        if (!current) return this.#refresh(house);
+        if (Date.now() - current.checkedAt >= this.#options.checkMs) {
+            this.#refresh(house).catch((error) => console.warn(`[auctions] checking house ${house.id} failed:`, error.message));
+        }
         return Promise.resolve(current);
     }
 
+    /** Asks Blizzard for anything newer than what the bot has, and updates the snapshot if there is. */
     #refresh(house: HouseRef): Promise<HouseSnapshot> {
         const pending = this.#loading.get(house.id);
         if (pending) return pending;
 
         const load = (async () => {
             const { rulesetId } = this.#options;
-            const auctions = await this.#api.auctionHouse(rulesetId, house.id);
-            const commodities = await this.#api.auctionHouseCommodities(rulesetId, house.id).catch((error) => {
-                if (isNotFound(error)) return undefined;
-                throw error;
+            const previous = this.#parts.get(house.id);
+            const [auctions, commodities] = await Promise.all([
+                this.#api.auctions(rulesetId, house.id, previous?.auctions.lastModified),
+                this.#api
+                    .commodities(rulesetId, house.id, previous?.commodities.lastModified)
+                    .catch((error): Fetched<Commodity> | undefined => {
+                        // Some houses have no commodities endpoint: treat that as empty, and later as unchanged.
+                        if (isNotFound(error)) return previous ? undefined : { listings: [] };
+                        throw error;
+                    }),
+            ]);
+
+            const now = Date.now();
+            const current = this.#snapshots.get(house.id);
+            if (current && previous && !auctions && !commodities) {
+                current.checkedAt = now;
+                return current;
+            }
+
+            const toPart = (fetched: Fetched<AuctionListing> | Fetched<Commodity>, kind: "auctions" | "commodities"): Part => ({
+                items: kind === "auctions"
+                    ? aggregateListings(fetched.listings as AuctionListing[])
+                    : aggregateListings(undefined, fetched.listings as Commodity[]),
+                listings: fetched.listings.length,
+                lastModified: fetched.lastModified,
             });
-            const items = aggregateListings(auctions.auctions, commodities?.auctions);
+            // A part Blizzard reported unchanged keeps what the bot already has.
+            const empty: Part = { items: new Map(), listings: 0 };
+            const parts = {
+                auctions: auctions ? toPart(auctions, "auctions") : (previous?.auctions ?? empty),
+                commodities: commodities ? toPart(commodities, "commodities") : (previous?.commodities ?? empty),
+            };
+            this.#parts.set(house.id, parts);
+
+            const stamps = [parts.auctions.lastModified, parts.commodities.lastModified].filter((stamp) => stamp !== undefined);
             const snapshot: HouseSnapshot = {
                 house,
-                fetchedAt: Date.now(),
-                items,
-                listings: (auctions.auctions?.length ?? 0) + (commodities?.auctions?.length ?? 0),
+                updatedAt: stamps.length ? Math.max(...stamps) : now,
+                checkedAt: now,
+                items: mergeItemPrices(parts.auctions.items, parts.commodities.items),
+                listings: parts.auctions.listings + parts.commodities.listings,
             };
             this.#snapshots.set(house.id, snapshot);
             return snapshot;
@@ -180,12 +254,43 @@ export class AuctionService {
         return { snapshots: results.filter((snapshot) => snapshot !== undefined), failed };
     }
 
+    /** Checks every loaded house for new data. Returns the houses that had some. */
+    async checkAll(): Promise<HouseRef[]> {
+        const houses = [...this.#snapshots.values()].map((snapshot) => snapshot.house);
+        const updated: HouseRef[] = [];
+        await mapLimit(houses, 2, async (house) => {
+            const before = this.#snapshots.get(house.id);
+            try {
+                const after = await this.#refresh(house);
+                if (after !== before) updated.push(house);
+            } catch (error) {
+                console.warn(`[auctions] checking house ${house.id} failed:`, (error as Error).message);
+            }
+        });
+        return updated;
+    }
+
+    /** Checks the loaded houses every `checkMs` until stopped. */
+    startPolling(onUpdate?: (houses: HouseRef[]) => void): void {
+        this.stopPolling();
+        this.#timer = setInterval(() => {
+            this.checkAll().then((houses) => houses.length && onUpdate?.(houses));
+        }, this.#options.checkMs);
+        // The timer alone shouldn't keep the process running.
+        this.#timer.unref();
+    }
+
+    stopPolling(): void {
+        clearInterval(this.#timer);
+        this.#timer = undefined;
+    }
+
     /** What each house a player of `faction` can use has of the item. */
     async prices(itemId: number, faction?: "alliance" | "horde"): Promise<PriceResult> {
         const { snapshots, failed } = await this.load(await this.housesFor(faction));
         const rows = snapshots.map((snapshot) => ({
             house: snapshot.house,
-            fetchedAt: snapshot.fetchedAt,
+            updatedAt: snapshot.updatedAt,
             price: snapshot.items.get(itemId),
         }));
         return { rows, failed };

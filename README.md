@@ -84,8 +84,10 @@ character's `/character info` card also names the member who plays it.
 - **Fifteen auction houses.** Each region lists five Alliance, five Horde and five neutral (Blackwater) houses, and
   the API doesn't say which one serves which players. `/price` shows each house of your faction separately. Once
   you've matched yours against in-game prices, set `AH_HOUSE_IDS` to show only those.
-- **Auction data is big and about hourly.** A busy house is around 9 MB. The bot keeps only a per-item summary in
-  memory, loads it at startup, and refreshes it in the background when it is older than `AH_MAX_AGE_MINUTES`.
+- **Auction data is big and about hourly.** Blizzard updates each house roughly once an hour, and a busy one is around
+  9 MB. The bot keeps only a per-item summary in memory, and every `AH_CHECK_MINUTES` (default 5) asks Blizzard
+  whether there is anything newer, which costs almost nothing when there isn't. `/price` shows when Blizzard last
+  updated the prices.
 - **Item data has gaps.** About 4 in 10 auctioned items are missing from Forever's item data. The bot falls back to
   Retail's data for the name, quality and icon, and marks the result: Retail's stats can differ.
 - **Stack prices.** Prices are shown per single item: a stack's buyout is divided by its size.

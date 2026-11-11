@@ -11,10 +11,13 @@ interface Seen {
     path: string;
     query: Record<string, string>;
     namespace: string | null;
+    since: string | null;
 }
 
 const seen: Seen[] = [];
 const responses = new Map<string, unknown>();
+/** Last-Modified times by request, for the endpoints that send one. */
+const modified = new Map<string, Date>();
 const realFetch = globalThis.fetch;
 
 before(() => {
@@ -26,10 +29,16 @@ before(() => {
         const headers = new Headers(init?.headers);
         assert.equal(headers.get("Authorization"), "Bearer test-token");
         const namespace = headers.get("Battlenet-Namespace");
-        seen.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), namespace });
-        const body = responses.get(`${namespace} ${url.pathname}`);
+        const since = headers.get("If-Modified-Since");
+        seen.push({ path: url.pathname, query: Object.fromEntries(url.searchParams), namespace, since });
+        const key = `${namespace} ${url.pathname}`;
+        const body = responses.get(key);
         // The live API answers unknown characters and items with a 404 and no body.
-        return body === undefined ? new Response(null, { status: 404, statusText: "Not Found" }) : Response.json(body);
+        if (body === undefined) return new Response(null, { status: 404, statusText: "Not Found" });
+        // Like the live auction endpoints: 304 with no body when the caller's copy is current.
+        const lastModified = modified.get(key);
+        if (lastModified && since && Date.parse(since) >= lastModified.getTime()) return new Response(null, { status: 304 });
+        return Response.json(body, lastModified ? { headers: { "Last-Modified": lastModified.toUTCString() } } : undefined);
     }) as typeof fetch;
 });
 
@@ -107,4 +116,36 @@ test("auction requests go through the configured ruleset, with the index's trail
         "dynamic-forever-us /data/wow/ruleset/15/auctions/113",
         "dynamic-forever-us /data/wow/ruleset/15/auctions/113/commodities",
     ]);
+});
+
+test("auction checks send the time of the bot's copy, and a 304 keeps it", async () => {
+    const house = "dynamic-forever-us /data/wow/ruleset/15/auctions/113";
+    const hourAgo = new Date(Math.floor(Date.now() / 1000) * 1000 - 60 * 60_000);
+    responses.set(house, { id: 113, name: "Horde Auction House", auctions: [{ id: 1, item: { id: 2589 }, buyout: 300, quantity: 1, time_left: "LONG" }] });
+    responses.set(`${house}/commodities`, { auctions: [{ id: 2, item: { id: 2592 }, quantity: 5, unit_price: 90, time_left: "LONG" }] });
+    modified.set(house, hourAgo);
+    modified.set(`${house}/commodities`, hourAgo);
+
+    const { auctions } = createContext({ ...config, auctionHouseIds: [113] });
+    const first = await auctions.prices(2589, "horde");
+    assert.equal(first.rows[0]?.updatedAt, hourAgo.getTime());
+    assert.equal(first.rows[0]?.price?.minBuyout, 300);
+    // The first download asks for everything.
+    assert.deepEqual(seen.splice(0).map((request) => request.since), [null, null, null]);
+
+    // Unchanged: both requests carry the copy's time and get 304s, and the prices stay.
+    assert.deepEqual(await auctions.checkAll(), []);
+    assert.deepEqual(seen.splice(0).map((request) => request.since), [hourAgo.toUTCString(), hourAgo.toUTCString()]);
+    assert.equal(auctions.loaded(113)?.items.get(2592)?.minBuyout, 90);
+
+    // New auctions, unchanged commodities: the commodities from before are kept.
+    const now = new Date(hourAgo.getTime() + 60 * 60_000);
+    responses.set(house, { id: 113, name: "Horde Auction House", auctions: [{ id: 3, item: { id: 2589 }, buyout: 250, quantity: 1, time_left: "LONG" }] });
+    modified.set(house, now);
+    assert.deepEqual((await auctions.checkAll()).map((entry) => entry.id), [113]);
+    seen.splice(0);
+    const snapshot = auctions.loaded(113);
+    assert.equal(snapshot?.updatedAt, now.getTime());
+    assert.equal(snapshot?.items.get(2589)?.minBuyout, 250);
+    assert.equal(snapshot?.items.get(2592)?.minBuyout, 90);
 });

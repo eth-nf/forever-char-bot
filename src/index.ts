@@ -45,6 +45,11 @@ client.once(Events.ClientReady, async (ready) => {
             })
             .catch((error) => console.warn("Loading auction data failed:", error.message));
     }
+    // Keeps every house the bot has loaded up to date, whether or not anyone is running /price.
+    ctx.auctions.startPolling((houses) => {
+        const stamps = houses.map((house) => ctx.auctions.loaded(house.id)?.updatedAt ?? 0);
+        console.log(`Auction data updated for ${houses.length} houses (Blizzard: ${new Date(Math.max(...stamps)).toISOString()}).`);
+    });
     if (config.defaultGuild) {
         ctx.forever.guild(config.defaultGuild).then((overview) => {
             if (overview) console.log(`Default guild <${overview.guild.name}>: ${overview.members.length} members.`);

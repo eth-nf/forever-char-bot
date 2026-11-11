@@ -4,12 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { ClaimStore } from "../src/claims/store.ts";
-import { aggregateListings, houseFaction } from "../src/blizzard/auctions.ts";
+import { aggregateListings, houseFaction, mergeItemPrices } from "../src/blizzard/auctions.ts";
 import { characterSlug, guildSlug, parseCharacterName } from "../src/blizzard/names.ts";
 import { ConfigError, loadConfig } from "../src/config.ts";
 import { mapLimit, TtlCache } from "../src/util/cache.ts";
 import { fitLines, formatMoney } from "../src/views/format.ts";
-import { BRAWLER_GLOVES, fakeApi, fakeContext, LINEN, WOOL } from "./fixtures.ts";
+import { AUCTIONS_UPDATED_AT, BRAWLER_GLOVES, fakeApi, fakeContext, LINEN, WOOL } from "./fixtures.ts";
 
 test("character names are parsed from what a player types", () => {
     assert.deepEqual(parseCharacterName("Chaos Chris"), { name: "Chaos", surname: "Chris" });
@@ -163,7 +163,7 @@ test("prices come from the player's faction and the neutral houses", async () =>
     assert.equal(wool.rows.find((row) => row.house.id === 114)?.price, undefined);
 
     // Snapshots are reused: one request per house, however many items are looked up.
-    assert.equal(api.calls.auctionHouse, 4);
+    assert.equal(api.calls.auctions, 4);
     assert.equal(api.calls.auctionHouses, 1);
 
     const all = await auctions.prices(BRAWLER_GLOVES);
@@ -188,16 +188,85 @@ test("AH_HOUSE_IDS limits which houses are used", async () => {
     assert.deepEqual(result.rows.map((row) => row.house.id), [114]);
 });
 
-test("a stale snapshot is served at once while a new one loads", async () => {
+test("prices are dated by when Blizzard updated them, not when the bot downloaded them", async () => {
+    const { auctions } = fakeContext(fakeApi(), { auctionHouseIds: [111] });
+    const result = await auctions.prices(LINEN, "horde");
+    assert.equal(result.rows[0]?.updatedAt, AUCTIONS_UPDATED_AT);
+    assert.ok((auctions.loaded(111)?.checkedAt ?? 0) > AUCTIONS_UPDATED_AT);
+});
+
+test("checks ask only for data newer than the bot's, and pick it up when there is some", async () => {
     const api = fakeApi();
-    const { auctions } = fakeContext(api, { auctionMaxAgeMinutes: 0, auctionHouseIds: [111] });
+    const { auctions } = fakeContext(api, { auctionHouseIds: [111, 114] });
+    await auctions.load(await auctions.housesFor("horde"));
+    const before = auctions.loaded(111)!;
+
+    // Nothing new: the snapshot stays, only the time of the check moves.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.deepEqual(await auctions.checkAll(), []);
+    assert.equal(auctions.loaded(111), before);
+    assert.ok(before.checkedAt > before.updatedAt);
+    assert.equal(api.calls.auctions, 4);
+
+    // Blizzard publishes new data.
+    api.state.updatedAt += 60 * 60_000;
+    api.state.priceChange = -100;
+    const updated = await auctions.checkAll();
+    assert.deepEqual(updated.map((house) => house.id).sort(), [111, 114]);
+    const after = auctions.loaded(111)!;
+    assert.equal(after.updatedAt, api.state.updatedAt);
+    assert.equal(after.items.get(LINEN)?.minBuyout, 61);
+    // The commodities came along too, merged into the same per-item summary.
+    assert.equal(after.items.get(WOOL)?.minBuyout, 310);
+    assert.equal(after.listings, 4);
+    // House 114 has no commodities endpoint; that doesn't make every check count as an update.
+    assert.deepEqual(await auctions.checkAll(), []);
+});
+
+test("polling keeps prices current without anyone looking them up", async () => {
+    const api = fakeApi();
+    // About 30 ms between checks.
+    const { auctions } = fakeContext(api, { auctionHouseIds: [111], auctionCheckMinutes: 0.0005 });
+    await auctions.prices(LINEN, "horde");
+    const seen: number[][] = [];
+    auctions.startPolling((houses) => seen.push(houses.map((house) => house.id)));
+    try {
+        api.state.updatedAt += 60 * 60_000;
+        api.state.priceChange = -100;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+    } finally {
+        auctions.stopPolling();
+    }
+    assert.deepEqual(seen, [[111]]);
+    // The next lookup has the new prices straight away.
+    const result = await auctions.prices(LINEN, "horde");
+    assert.equal(result.rows[0]?.price?.minBuyout, 61);
+    assert.equal(result.rows[0]?.updatedAt, api.state.updatedAt);
+});
+
+test("without polling, a lookup starts a check once the last one is too old", async () => {
+    const api = fakeApi();
+    const { auctions } = fakeContext(api, { auctionHouseIds: [111], auctionCheckMinutes: 0.0001 });
     assert.equal(auctions.isListed(LINEN), undefined);
-    const first = await auctions.prices(LINEN, "horde");
-    const second = await auctions.prices(LINEN, "horde");
-    assert.equal(second.rows[0]?.fetchedAt, first.rows[0]?.fetchedAt);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(api.calls.auctionHouse, 2);
-    assert.ok((auctions.loaded(111)?.fetchedAt ?? 0) >= (first.rows[0]?.fetchedAt ?? 0));
+    await auctions.prices(LINEN, "horde");
+    api.state.updatedAt += 60 * 60_000;
+    api.state.priceChange = -100;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+
+    // This lookup gets what the bot has at once, and starts the check in the background.
+    const served = await auctions.prices(LINEN, "horde");
+    assert.equal(served.rows[0]?.price?.minBuyout, 161);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.equal(auctions.loaded(111)?.items.get(LINEN)?.minBuyout, 61);
+});
+
+test("per-item summaries merge as if aggregated together", () => {
+    const auctionsOnly = aggregateListings([{ id: 1, item: { id: 7 }, buyout: 500, bid: 100, quantity: 1, time_left: "LONG" }]);
+    const commoditiesOnly = aggregateListings(undefined, [{ id: 2, item: { id: 7 }, quantity: 3, unit_price: 400, time_left: "LONG" }]);
+    assert.deepEqual(mergeItemPrices(auctionsOnly, commoditiesOnly).get(7), { quantity: 4, listings: 2, minBuyout: 400, minBid: 100 });
+    assert.deepEqual(mergeItemPrices(auctionsOnly, new Map()), auctionsOnly);
+    // The inputs are left as they were.
+    assert.equal(auctionsOnly.get(7)?.minBuyout, 500);
 });
 
 test("items missing from Forever fall back to Retail", async () => {

@@ -88,7 +88,7 @@ export function priceEmbed(info: ItemInfo, result: PriceResult): EmbedBuilder {
         embed.addFields({ name: "Vendor sells for", value: formatMoney(info.item.sell_price), inline: true });
     }
     if (result.rows.length) {
-        const oldest = Math.min(...result.rows.map((row) => row.fetchedAt));
+        const oldest = Math.min(...result.rows.map((row) => row.updatedAt));
         embed.addFields({ name: "Prices from", value: relativeTime(oldest), inline: true });
     }
     if (result.failed.length) {
